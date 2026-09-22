@@ -15,7 +15,8 @@ Requiere en .streamlit/secrets.toml (o variables de entorno equivalentes):
     SUPABASE_SERVICE_ROLE_KEY = "..."   # clave service_role (RLS activado en las tablas, 09/09/2026)
 
 Requiere también haber ejecutado migracion_v2_subtipos_catalogo.sql
-sobre la base de datos (añade la tabla subtipos_catalogo).
+(añade la tabla subtipos_catalogo) y migracion_multiproyecto.sql
+(añade la tabla proyectos + activos.proyecto_id) sobre la base de datos.
 El árbol de dependencias usa st.graphviz_chart, que necesita el binario
 `graphviz` instalado en el sistema (ver packages.txt si se despliega en
 Streamlit Community Cloud).
@@ -58,8 +59,14 @@ sb = get_client()
 # ---------------------------------------------------------------------
 # Lectura de datos (sin cachear: siempre al día, la app es de uso interno)
 # ---------------------------------------------------------------------
-def cargar_activos():
-    res = sb.table("activos").select("*, activo_subtipos(subtipo)").execute()
+def cargar_proyectos():
+    res = sb.table("proyectos").select("*").order("nombre").execute()
+    return res.data
+
+
+def cargar_activos(proyecto_id):
+    res = sb.table("activos").select("*, activo_subtipos(subtipo)") \
+        .eq("proyecto_id", proyecto_id).execute()
     activos = {}
     id_to_codigo = {}
     for row in res.data:
@@ -77,13 +84,24 @@ def cargar_activos():
 
 
 def cargar_dependencias(id_to_codigo):
-    res = sb.table("dependencias").select("*").execute()
+    """Solo dependencias cuyo activo superior pertenece al proyecto activo
+    (dependencias no tiene proyecto_id propio: se filtra por los activos
+    del proyecto, vía id_to_codigo, que ya viene filtrado por proyecto)."""
+    ids_proyecto = list(id_to_codigo.keys())
+    if not ids_proyecto:
+        return [], []
+    res = sb.table("dependencias").select("*").in_("activo_superior_id", ids_proyecto).execute()
     return [(id_to_codigo[r["activo_superior_id"]], id_to_codigo[r["activo_inferior_id"]], r["grado"])
             for r in res.data], res.data
 
 
 def cargar_personas(id_to_codigo):
-    res = sb.table("personas_asociadas").select("*").execute()
+    """Igual que cargar_dependencias: personas_asociadas no tiene
+    proyecto_id propio, se filtra por los activos del proyecto activo."""
+    ids_proyecto = list(id_to_codigo.keys())
+    if not ids_proyecto:
+        return [], []
+    res = sb.table("personas_asociadas").select("*").in_("activo_id", ids_proyecto).execute()
     return [(id_to_codigo[r["activo_id"]], r["persona_nombre"], r["tipo_rol"], r["grado"])
             for r in res.data], res.data
 
@@ -430,6 +448,38 @@ def render_pagina_metrica(nombre_metrica, campo_cualitativo, key_prefix, subtitu
 
 
 # ---------------------------------------------------------------------
+# Selección de proyecto (barra lateral) -- cada proyecto tiene sus propios
+# activos/dependencias/personas; el catálogo de amenazas y las salvaguardas
+# son comunes a todos.
+# ---------------------------------------------------------------------
+proyectos = cargar_proyectos()
+if not proyectos:
+    st.error("No hay ningún proyecto creado. Ejecuta migracion_multiproyecto.sql "
+              "sobre la base de datos antes de continuar.")
+    st.stop()
+
+nombres_proyecto = [p["nombre"] for p in proyectos]
+indice_proyecto_defecto = (
+    nombres_proyecto.index(st.session_state["proyecto_nombre"])
+    if st.session_state.get("proyecto_nombre") in nombres_proyecto else 0
+)
+proyecto_sel_nombre = st.sidebar.selectbox(
+    "📁 Proyecto", nombres_proyecto, index=indice_proyecto_defecto, key="selector_proyecto",
+)
+proyecto_actual = next(p for p in proyectos if p["nombre"] == proyecto_sel_nombre)
+st.session_state["proyecto_nombre"] = proyecto_actual["nombre"]
+st.session_state["proyecto_id"] = proyecto_actual["id"]
+
+# Cambiar de proyecto invalida los resultados de recálculo del proyecto
+# anterior (son específicos de sus activos/dependencias/personas).
+if st.session_state.get("_proyecto_anterior") not in (None, proyecto_actual["id"]):
+    for _key in ["valor_acum", "amenazas_directas", "filas_prop"]:
+        st.session_state.pop(_key, None)
+st.session_state["_proyecto_anterior"] = proyecto_actual["id"]
+
+st.sidebar.divider()
+
+# ---------------------------------------------------------------------
 # Contexto del proyecto (Factor de Riesgo Contextual)
 # ---------------------------------------------------------------------
 # Sector fijo por ahora (Banca / Infraestructuras financieras -- unico
@@ -468,7 +518,7 @@ st.sidebar.divider()
 # ---------------------------------------------------------------------
 pagina = st.sidebar.radio(
     "Navegación",
-    ["Activos", "Dependencias", "Personas asociadas", "Salvaguardas", "Amenazas", "Impacto", "Riesgo"],
+    ["Proyectos", "Activos", "Dependencias", "Personas asociadas", "Salvaguardas", "Amenazas", "Impacto", "Riesgo"],
 )
 
 # Cambiar de página cancela cualquier edición en curso (activo o dependencia),
@@ -478,15 +528,77 @@ if st.session_state.get("_pagina_anterior") not in (None, pagina):
         st.session_state.pop(_key, None)
 st.session_state["_pagina_anterior"] = pagina
 
-activos, id_to_codigo = cargar_activos()
+activos, id_to_codigo = cargar_activos(st.session_state["proyecto_id"])
 opciones_codigo = sorted(activos.keys())
 subtipos_por_tipo = cargar_subtipos_catalogo()
 
 
 # ---------------------------------------------------------------------
+# Página: Proyectos
+# ---------------------------------------------------------------------
+if pagina == "Proyectos":
+    st.title("Proyectos")
+    st.caption("Cada proyecto tiene sus propios activos, dependencias y personas asociadas. "
+               "El catálogo de amenazas y las salvaguardas son comunes a todos los proyectos.")
+
+    st.subheader(f"Proyectos existentes ({len(proyectos)})")
+    filas_p = [{"Nombre": p["nombre"], "Sector": p.get("sector"), "Tamaño": p.get("tamano"),
+                "Descripción": p.get("descripcion")} for p in proyectos]
+    st.dataframe(pd.DataFrame(filas_p), use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.subheader("Eliminar proyecto")
+    if len(proyectos) <= 1:
+        st.caption("No se puede eliminar el único proyecto que queda.")
+    else:
+        nombre_eliminar = st.selectbox(
+            "Selecciona el proyecto a eliminar", nombres_proyecto, key="proyecto_a_eliminar",
+        )
+        proyecto_eliminar = next(p for p in proyectos if p["nombre"] == nombre_eliminar)
+        n_activos_p = sb.table("activos").select("id", count="exact") \
+            .eq("proyecto_id", proyecto_eliminar["id"]).execute().count or 0
+        if n_activos_p:
+            st.warning(
+                f"Este proyecto tiene {n_activos_p} activo(s); se eliminarán también "
+                "sus dependencias, personas asociadas y salvaguardas asignadas."
+            )
+        confirmar_borrado_p = st.checkbox(
+            f"Sí, entiendo que se borrará \"{nombre_eliminar}\" y todo lo que contiene",
+            key="confirmar_borrado_proyecto",
+        )
+        if st.button("🗑️ Eliminar proyecto", disabled=not confirmar_borrado_p):
+            sb.table("proyectos").delete().eq("id", proyecto_eliminar["id"]).execute()
+            st.success(f"Proyecto {nombre_eliminar} eliminado.")
+            if st.session_state.get("proyecto_nombre") == nombre_eliminar:
+                st.session_state.pop("proyecto_nombre", None)
+            st.rerun()
+
+    st.markdown("---")
+    st.subheader("Nuevo proyecto")
+    with st.form("nuevo_proyecto"):
+        nombre_p = st.text_input("Nombre (único)")
+        sector_p = st.text_input("Sector")
+        tamano_p = st.text_input("Tamaño")
+        descripcion_p = st.text_area("Descripción")
+        if st.form_submit_button("Crear proyecto"):
+            if not nombre_p:
+                st.error("El nombre es obligatorio.")
+            elif nombre_p in nombres_proyecto:
+                st.error(f"Ya existe un proyecto llamado {nombre_p}.")
+            else:
+                sb.table("proyectos").insert({
+                    "nombre": nombre_p, "sector": sector_p or None,
+                    "tamano": tamano_p or None, "descripcion": descripcion_p or None,
+                }).execute()
+                st.success(f"Proyecto {nombre_p} creado.")
+                st.session_state["proyecto_nombre"] = nombre_p
+                st.rerun()
+
+
+# ---------------------------------------------------------------------
 # Página: Activos
 # ---------------------------------------------------------------------
-if pagina == "Activos":
+elif pagina == "Activos":
     st.title("Activos")
 
     # --- Activos existentes (primero, agrupados por tipo, con edición en bloque) ---
@@ -717,6 +829,7 @@ if pagina == "Activos":
                 st.error(f"Ya existe un activo con código {codigo}.")
             else:
                 nuevo = sb.table("activos").insert({
+                    "proyecto_id": st.session_state["proyecto_id"],
                     "codigo": codigo, "nombre": nombre, "tipo": tipo_nuevo,
                     "valor_propio_d": VALORACION_A_NUMERO[val_d],
                     "valor_propio_i": VALORACION_A_NUMERO[val_i],
