@@ -907,18 +907,48 @@ elif pagina == "Dependencias":
 
         st.subheader("Árbol de dependencias (descendente)")
         trans = dependencias_transitivas(cod_foco, dep_adj_forward)
-        if not trans:
-            st.caption("Este activo no tiene dependencias descendentes.")
+
+        # Personas asociadas: solo para pintarlas como nodos hijos del árbol,
+        # no se crea ni duplica nada en la tabla dependencias -- se reutilizan
+        # tal cual los datos de personas_asociadas y el grado_transitivo ya
+        # calculado por dependencias_transitivas().
+        per_edges_arbol, _ = cargar_personas(id_to_codigo)
+        personas_por_activo = defaultdict(list)
+        for cod_p, persona_nombre, tipo_rol, grado_p in per_edges_arbol:
+            personas_por_activo[cod_p].append((persona_nombre, tipo_rol, grado_p))
+
+        if not trans and not personas_por_activo.get(cod_foco):
+            st.caption("Este activo no tiene dependencias descendentes ni personas asociadas.")
         else:
-            nodos_incluidos = {cod_foco} | set(trans.keys())
+            grado_activo = {cod_foco: 100.0, **trans}
+            nodos_incluidos = set(grado_activo.keys())
             dot = ['digraph G {', 'rankdir=LR;', 'node [shape=box, style=filled, fontsize=10, fontname="Helvetica"];']
             for n in nodos_incluidos:
                 color = "#c7d2fe" if n == cod_foco else "#eef2ff"
                 nombre_n = activos[n]["nombre"].replace('"', "'")
-                dot.append(f'"{n}" [label="{n}\\n{nombre_n}", fillcolor="{color}"];')
+                dot.append(f'"{n}" [label="{n}\\n{nombre_n}", shape=box, fillcolor="{color}"];')
             for sup, inf, grado in dep_edges:
                 if sup in nodos_incluidos and inf in nodos_incluidos:
                     dot.append(f'"{sup}" -> "{inf}" [label="{grado}%", fontsize=9];')
+
+            # --- Personas asociadas, como nodos hijos de cada activo alcanzado.
+            # Grado propio = el de la relación persona<->activo (personas_asociadas.grado).
+            # Grado efectivo = grado_transitivo del activo (100% si es el propio
+            # cod_foco) x grado propio -- ver ejemplo en la petición del usuario.
+            for n in nodos_incluidos:
+                for idx, (persona_nombre, tipo_rol, grado_p) in enumerate(personas_por_activo.get(n, [])):
+                    grado_efectivo = round(grado_activo[n] * (grado_p / 100.0), 1)
+                    nodo_persona = f"persona::{n}::{idx}"
+                    persona_label = persona_nombre.replace('"', "'")
+                    dot.append(
+                        f'"{nodo_persona}" [label="{persona_label}\\n{tipo_rol}\\nGrado propio: {grado_p}%", '
+                        f'shape=ellipse, style=filled, fillcolor="#fde68a", fontsize=9];'
+                    )
+                    dot.append(
+                        f'"{n}" -> "{nodo_persona}" [label="{grado_efectivo}% efectivo", '
+                        f'fontsize=9, style=dashed, color="#b45309"];'
+                    )
+
             dot.append('}')
             st.graphviz_chart("\n".join(dot))
 
